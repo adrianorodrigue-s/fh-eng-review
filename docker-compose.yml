@@ -1,0 +1,29 @@
+# Lib de revisão de código para engenharias de dados.
+# Uso (prefira o wrapper ./review.sh):
+#   TARGET=/caminho/da/engenharia docker compose run --rm review
+#   docker compose up -d dashboard   →  http://localhost:3000
+services:
+  review:
+    build: .
+    image: etl-code-review:latest
+    volumes:
+      # a lib (código + reports) — a imagem não precisa ser reconstruída
+      - .:/review
+      # a engenharia a revisar (default: pasta acima da lib)
+      - ${TARGET:-..}:/target
+      # cache do banco de vulnerabilidades do Trivy (evita re-download a cada run)
+      - trivy-cache:/home/reviewer/.cache/trivy
+    entrypoint: ["python", "-m", "review", "--target", "/target"]
+
+  dashboard:
+    build: ./dashboard
+    image: etl-code-review-dashboard:latest
+    environment:
+      - REPORTS_DIR=/reports
+    volumes:
+      - ./reports:/reports:ro
+    ports:
+      - "${DASHBOARD_PORT:-3000}:3000"
+
+volumes:
+  trivy-cache:

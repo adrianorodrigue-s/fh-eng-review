@@ -1,0 +1,14 @@
+# Config Ruff padrão do time — usada quando a engenharia alvo não tem
+# a sua própria ([tool.ruff] no pyproject.toml ou ruff.toml).
+target-version = "py311"
+line-length = 100
+extend-exclude = ["dbt"]
+
+[lint]
+# E/W = estilo, F = erros, I = imports, UP = modernização,
+# B = bugs prováveis, S = segurança (bandit), PD = boas práticas pandas
+select = ["E", "W", "F", "I", "UP", "B", "S", "PD"]
+
+[lint.per-file-ignores]
+# assert é esperado em testes
+"tests/**" = ["S101"]

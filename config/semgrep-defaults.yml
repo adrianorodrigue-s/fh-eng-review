@@ -1,0 +1,77 @@
+rules:
+  # --- Segurança -----------------------------------------------------------
+
+  - id: sql-injection-fstring
+    languages: [python]
+    severity: ERROR
+    message: >
+      SQL montado com f-string permite SQL Injection. Use query parametrizada
+      (ex.: cursor.execute("... WHERE id = %s", (id,)) ou query parameters do
+      BigQuery).
+    pattern-either:
+      - pattern: $CURSOR.execute(f"...")
+      - pattern: $CLIENT.query(f"...")
+      - pattern: pd.read_gbq(f"...", ...)
+      - pattern: pandas_gbq.read_gbq(f"...", ...)
+      - pattern: |
+          $Q = f"..."
+          ...
+          $CURSOR.execute($Q)
+      - pattern: |
+          $Q = f"..."
+          ...
+          $CLIENT.query($Q)
+
+  - id: hardcoded-secret
+    languages: [python]
+    severity: ERROR
+    message: >
+      Credencial fixa no código. Use variável de ambiente ou um gerenciador de
+      segredos (Secret Manager, Vault etc.).
+    patterns:
+      - pattern: $KEY = "..."
+      - metavariable-regex:
+          metavariable: $KEY
+          regex: (?i).*(password|passwd|senha|secret|token|api_?key|private_?key).*
+      - pattern-not: $KEY = ""
+
+  - id: dangerous-eval-exec
+    languages: [python]
+    severity: ERROR
+    message: eval()/exec() permitem execução arbitrária de código. Remova ou substitua.
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: exec(...)
+
+  - id: subprocess-shell-true
+    languages: [python]
+    severity: ERROR
+    message: >
+      subprocess com shell=True e entrada dinâmica permite Command Injection.
+      Passe o comando como lista, sem shell=True.
+    pattern-either:
+      - pattern: subprocess.run(..., shell=True, ...)
+      - pattern: subprocess.Popen(..., shell=True, ...)
+      - pattern: subprocess.call(..., shell=True, ...)
+
+  # --- Padrões do time (engenharia de dados) --------------------------------
+
+  - id: read-csv-sem-encoding
+    languages: [python]
+    severity: WARNING
+    message: >
+      pd.read_csv sem encoding explícito pode quebrar entre ambientes.
+      Padrão do time: sempre informar encoding= (ex.: encoding="utf-8").
+    patterns:
+      - pattern: pd.read_csv(...)
+      - pattern-not: pd.read_csv(..., encoding=..., ...)
+
+  - id: drop-duplicates-sem-subset
+    languages: [python]
+    severity: WARNING
+    message: >
+      drop_duplicates() sem subset= deduplica pela linha inteira, o que raramente
+      é a intenção em pipelines. Padrão do time: sempre informar subset=.
+    patterns:
+      - pattern: $DF.drop_duplicates(...)
+      - pattern-not: $DF.drop_duplicates(..., subset=..., ...)
