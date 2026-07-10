@@ -37,8 +37,12 @@ case "${1:-}" in
         ;;
 esac
 
-TARGET_INPUT="${1:-..}"
-if [[ $# -gt 0 ]]; then shift; fi
+if [[ "${1:-}" == -* ]]; then
+    TARGET_INPUT=".."
+else
+    TARGET_INPUT="${1:-..}"
+    if [[ $# -gt 0 ]]; then shift; fi
+fi
 
 TARGET="$(cd "$TARGET_INPUT" && pwd)"
 export TARGET

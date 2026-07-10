@@ -50,7 +50,7 @@ def _finding(**kwargs) -> Finding:
 class Step:
     key: str
     title: str
-    build_cmd: Callable[[Path], list[str]]
+    build_cmd: Callable[[Path, list[str] | None], list[str]]
     parse_findings: Callable[[str, Path], list[Finding]]
     # códigos de saída considerados sucesso (pytest devolve 5 quando não há testes)
     ok_codes: set[int] = field(default_factory=lambda: {0})
@@ -77,8 +77,12 @@ def _ruff_config_args(target: Path) -> list[str]:
     return ["--config", str(LIB_DIR / "config" / "ruff-defaults.toml")]
 
 
-def _ruff_check_cmd(target: Path) -> list[str]:
-    return ["ruff", "check", ".", "--output-format", "json", *_ruff_config_args(target)]
+def _ruff_check_cmd(target: Path, ignore_dirs: list[str] | None = None) -> list[str]:
+    cmd = ["ruff", "check", ".", "--output-format", "json", *_ruff_config_args(target)]
+    if ignore_dirs:
+        for d in ignore_dirs:
+            cmd.extend(["--exclude", d])
+    return cmd
 
 
 def _parse_ruff_check(stdout: str, target: Path) -> list[Finding]:
@@ -107,8 +111,12 @@ def _parse_ruff_check(stdout: str, target: Path) -> list[Finding]:
     return findings
 
 
-def _ruff_format_cmd(target: Path) -> list[str]:
-    return ["ruff", "format", "--check", ".", *_ruff_config_args(target)]
+def _ruff_format_cmd(target: Path, ignore_dirs: list[str] | None = None) -> list[str]:
+    cmd = ["ruff", "format", "--check", ".", *_ruff_config_args(target)]
+    if ignore_dirs:
+        for d in ignore_dirs:
+            cmd.extend(["--exclude", d])
+    return cmd
 
 
 def _parse_ruff_format(stdout: str, target: Path) -> list[Finding]:
@@ -134,9 +142,9 @@ def _parse_ruff_format(stdout: str, target: Path) -> list[Finding]:
 _JUNIT = Path(os.environ.get("TMPDIR", "/tmp")) / "review-pytest.xml"  # noqa: S108
 
 
-def _pytest_cmd(target: Path) -> list[str]:
+def _pytest_cmd(target: Path, ignore_dirs: list[str] | None = None) -> list[str]:
     _JUNIT.unlink(missing_ok=True)
-    return [
+    cmd = [
         "pytest",
         "-q",
         "-p",
@@ -145,6 +153,10 @@ def _pytest_cmd(target: Path) -> list[str]:
         "junit_family=xunit1",  # inclui arquivo/linha no XML
         f"--junitxml={_JUNIT}",
     ]
+    if ignore_dirs:
+        for d in ignore_dirs:
+            cmd.append(f"--ignore={d}")
+    return cmd
 
 
 def _parse_pytest(stdout: str, target: Path) -> list[Finding]:
@@ -181,11 +193,11 @@ def _parse_pytest(stdout: str, target: Path) -> list[Finding]:
 # --- Semgrep ------------------------------------------------------------
 
 
-def _semgrep_cmd(target: Path) -> list[str]:
+def _semgrep_cmd(target: Path, ignore_dirs: list[str] | None = None) -> list[str]:
     project_rules = target / ".semgrep.yml"
     default_rules = LIB_DIR / "config" / "semgrep-defaults.yml"
     config = project_rules if project_rules.exists() else default_rules
-    return [
+    cmd = [
         "semgrep",
         "scan",
         "--config",
@@ -195,6 +207,10 @@ def _semgrep_cmd(target: Path) -> list[str]:
         "--error",
         "--quiet",
     ]
+    if ignore_dirs:
+        for d in ignore_dirs:
+            cmd.extend(["--exclude", d])
+    return cmd
 
 
 def _parse_semgrep(stdout: str, target: Path) -> list[Finding]:
@@ -232,8 +248,8 @@ def _parse_semgrep(stdout: str, target: Path) -> list[Finding]:
 # --- Trivy --------------------------------------------------------------
 
 
-def _trivy_cmd(target: Path) -> list[str]:
-    return [
+def _trivy_cmd(target: Path, ignore_dirs: list[str] | None = None) -> list[str]:
+    cmd = [
         "trivy",
         "fs",
         "--scanners",
@@ -245,8 +261,12 @@ def _trivy_cmd(target: Path) -> list[str]:
         "--format",
         "json",
         "--quiet",
-        ".",
     ]
+    if ignore_dirs:
+        for d in ignore_dirs:
+            cmd.extend(["--skip-dirs", d])
+    cmd.append(".")
+    return cmd
 
 
 def _code_lines(obj: dict) -> tuple[str, int | None]:

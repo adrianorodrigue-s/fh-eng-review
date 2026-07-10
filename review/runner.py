@@ -31,7 +31,9 @@ def _enrich_snippets(findings: list[dict], target: Path) -> None:
         if file not in cache:
             path = target / file
             try:
-                cache[file] = path.read_text(encoding="utf-8", errors="replace").splitlines()
+                cache[file] = path.read_text(
+                    encoding="utf-8", errors="replace"
+                ).splitlines()
             except OSError:
                 cache[file] = None
         lines = cache[file]
@@ -60,9 +62,9 @@ def _print_findings(findings: list[dict]) -> None:
         print(f"  ... e mais {rest} achado(s) — veja os detalhes no dashboard")
 
 
-def _run_step(step: Step, target: Path) -> dict:
+def _run_step(step: Step, target: Path, ignore_dirs: list[str] | None = None) -> dict:
     _banner(step.title)
-    cmd = step.build_cmd(target)
+    cmd = step.build_cmd(target, ignore_dirs)
 
     result = {
         "key": step.key,
@@ -118,13 +120,16 @@ def run_review(
     fail_fast: bool = False,
     reports_dir: Path | None = None,
     save: bool = True,
+    ignore_dirs: list[str] | None = None,
 ) -> dict:
     started = datetime.now()
-    selected = [s for s in STEPS if (not only or s.key in only) and s.key not in (skip or [])]
+    selected = [
+        s for s in STEPS if (not only or s.key in only) and s.key not in (skip or [])
+    ]
 
     step_results: list[dict] = []
     for step in selected:
-        step_results.append(_run_step(step, target))
+        step_results.append(_run_step(step, target, ignore_dirs))
         if step_results[-1]["status"] == "FAIL" and fail_fast:
             break
 
@@ -154,7 +159,11 @@ def run_review(
         print(f"\nRelatório salvo em: {path}")
 
     if passed:
-        print(f"\n{GREEN}{BOLD}Todas as validações passaram. Pronto para commit! ✅{RESET}")
+        print(
+            f"\n{GREEN}{BOLD}Todas as validações passaram. Pronto para commit! ✅{RESET}"
+        )
     else:
-        print(f"\n{RED}{BOLD}Revisão reprovada — corrija os problemas antes de commitar.{RESET}")
+        print(
+            f"\n{RED}{BOLD}Revisão reprovada — corrija os problemas antes de commitar.{RESET}"
+        )
     return report
