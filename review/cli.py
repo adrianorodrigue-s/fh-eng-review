@@ -23,21 +23,13 @@ def main(argv: list[str] | None = None) -> int:
         default=os.environ.get("PROJECT_NAME") or None,
         help="nome da engenharia (default: nome da pasta alvo)",
     )
-    parser.add_argument(
-        "--only", nargs="+", choices=keys, help="roda apenas os passos indicados"
-    )
+    parser.add_argument("--only", nargs="+", choices=keys, help="roda apenas os passos indicados")
     parser.add_argument(
         "--skip", nargs="+", choices=keys, default=[], help="pula os passos indicados"
     )
-    parser.add_argument(
-        "--fail-fast", action="store_true", help="interrompe na primeira falha"
-    )
-    parser.add_argument(
-        "--reports-dir", default=None, help="pasta onde salvar os relatórios"
-    )
-    parser.add_argument(
-        "--no-report", action="store_true", help="não salva o relatório JSON"
-    )
+    parser.add_argument("--fail-fast", action="store_true", help="interrompe na primeira falha")
+    parser.add_argument("--reports-dir", default=None, help="pasta onde salvar os relatórios")
+    parser.add_argument("--no-report", action="store_true", help="não salva o relatório JSON")
     parser.add_argument(
         "--ignore-dir",
         action="append",
