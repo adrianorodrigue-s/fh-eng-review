@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shlex
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -152,6 +154,7 @@ def _pytest_cmd(target: Path, ignore_dirs: list[str] | None = None) -> list[str]
         "-o",
         "junit_family=xunit1",  # inclui arquivo/linha no XML
         f"--junitxml={_JUNIT}",
+        "--ignore-glob=*/dbt_packages/*",
     ]
     if ignore_dirs:
         for d in ignore_dirs:
@@ -344,6 +347,222 @@ def _parse_trivy(stdout: str, target: Path) -> list[Finding]:
     return findings
 
 
+# --- Yamllint -------------------------------------------------------------
+
+
+def _yamllint_config_args(target: Path) -> list[str]:
+    """Usa a config do próprio projeto se existir; senão, o default da lib."""
+    for name in (".yamllint", ".yamllint.yaml", ".yamllint.yml"):
+        if (target / name).exists():
+            return []
+    return ["--config-file", str(LIB_DIR / "config" / "yamllint-defaults.yml")]
+
+
+def _yamllint_cmd(target: Path, ignore_dirs: list[str] | None = None) -> list[str]:
+    # yamllint não tem flag de exclusão de diretório (diferente das outras
+    # etapas, que usam --exclude/--ignore/--skip-dirs) — quem ignora
+    # diretório é a chave `ignore:` do próprio arquivo de config (ver
+    # config/yamllint-defaults.yml ou o .yamllint do projeto alvo).
+    # --strict: sem isso, warnings sozinhos não derrubam o exit code (só
+    # erros), o que quebraria a regra "qualquer achado reprova" das outras etapas.
+    return [
+        "yamllint",
+        "--format",
+        "parsable",
+        "--strict",
+        *_yamllint_config_args(target),
+        ".",
+    ]
+
+
+# saída de `yamllint --format parsable`: "<file>:<line>:<col>: [<level>] <desc> (<rule>)"
+_YAMLLINT_LINE = re.compile(
+    r"^(?P<file>.+):(?P<line>\d+):(?P<col>\d+): \[(?P<level>error|warning)\] (?P<message>.*)$"
+)
+_YAMLLINT_RULE_SUFFIX = re.compile(r"^(?P<desc>.*) \((?P<rule>[a-z][a-z-]*)\)$")
+
+
+def _parse_yamllint(stdout: str, target: Path) -> list[Finding]:
+    findings = []
+    for line in stdout.splitlines():
+        m = _YAMLLINT_LINE.match(line)
+        if not m:
+            continue
+        rule_match = _YAMLLINT_RULE_SUFFIX.match(m.group("message"))
+        desc, rule = (
+            (rule_match.group("desc"), rule_match.group("rule"))
+            if rule_match
+            else (m.group("message"), "syntax-error")
+        )
+        findings.append(
+            _finding(
+                file=_rel(m.group("file").removeprefix("./"), target),
+                line=int(m.group("line")),
+                rule=rule,
+                severity=m.group("level").upper(),
+                message=desc,
+            )
+        )
+    return findings
+
+
+# --- SQLFluff (dbt) --------------------------------------------------------
+
+# Credencial de BigQuery pro templater dbt: nunca fica na imagem nem no repo.
+# Quem chama `./review.sh ... --keyfile <caminho>` monta o arquivo como
+# volume (docker-compose.yml) e o container recebe essa env var apontando
+# pra ele. google.auth.default() (usado pelo `method: oauth` do dbt-bigquery)
+# já prioriza essa variável antes de sessão gcloud local/metadata server, então
+# o profiles.yml do projeto analisado não precisa mudar nada.
+_SQLFLUFF_KEYFILE_ENV = "GOOGLE_APPLICATION_CREDENTIALS"
+
+
+def _sqlfluff_error_cmd(message: str) -> list[str]:
+    """Comando "falso" que só imprime uma mensagem clara e falha — usado
+    quando falta pré-requisito (keyfile, dbt_project.yml), pra não deixar
+    um stack trace cru do dbt/sqlfluff estourar no dashboard."""
+    return ["sh", "-c", f"echo {shlex.quote(message)} >&2; exit 1"]
+
+
+def _find_dbt_project_dir(target: Path) -> Path | None:
+    """Acha a raiz do projeto dbt dentro de `target`: o próprio `target` ou,
+    no máximo, um nível de subpasta (ex.: a engenharia é a raiz do repo, mas
+    o projeto dbt fica em <target>/<algum_nome>/). Não assume nome de
+    projeto — se achar 0 ou mais de 1 candidato, devolve None."""
+    if (target / "dbt_project.yml").exists():
+        return target
+    matches = [d for d in target.iterdir() if d.is_dir() and (d / "dbt_project.yml").exists()]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _sqlfluff_config_args(dbt_project_dir: Path) -> list[str]:
+    """Usa o .sqlfluff do próprio projeto se existir; senão, o default da lib.
+
+    Sempre passa --config explícito (não deixa o sqlfluff descobrir sozinho
+    a partir do cwd): a descoberta nativa por nesting é o que causa o warning
+    "Attempt to set templater to dbt failed... cannot be set in a .sqlfluff
+    file in a subdirectory of the current working directory" quando há
+    qualquer ambiguidade de onde o cwd "raiz" está — apontar o arquivo direto
+    remove essa ambiguidade.
+    """
+    project_config = dbt_project_dir / ".sqlfluff"
+    config = project_config if project_config.exists() else LIB_DIR / "config" / "sqlfluff-defaults.cfg"
+    return ["--config", str(config)]
+
+
+def _sqlfluff_cmd(target: Path, ignore_dirs: list[str] | None = None) -> list[str]:
+    # ignore_dirs não se aplica aqui: SQLFluff não tem flag de exclusão de
+    # diretório via CLI (só .sqlfluffignore dentro do projeto dbt) — mesma
+    # limitação já documentada no yamllint.
+    keyfile = Path(os.environ.get(_SQLFLUFF_KEYFILE_ENV, ""))
+    if not keyfile.is_file() or keyfile.stat().st_size == 0:
+        return _sqlfluff_error_cmd(
+            "SQLFluff requer keyfile de um projeto dbt válido, use --keyfile <caminho>"
+        )
+
+    dbt_project_dir = _find_dbt_project_dir(target)
+    if dbt_project_dir is None:
+        return _sqlfluff_error_cmd(
+            f"SQLFluff: não encontrei dbt_project.yml em {target} nem em um "
+            "subdiretório direto — aponte --target pra raiz do projeto dbt "
+            "(ou pra pasta que contém o projeto dbt)"
+        )
+
+    project_dir_q = shlex.quote(str(dbt_project_dir))
+    config_args = " ".join(shlex.quote(a) for a in _sqlfluff_config_args(dbt_project_dir))
+    cmd_str = (
+        f"cd {project_dir_q} && "
+        # dbt deps escreve logs no stdout; sem isso esse texto fica
+        # concatenado ANTES do JSON que o sqlfluff escreve no stdout,
+        # quebrando o json.loads em _parse_sqlfluff (que exige stdout
+        # inteiro como JSON válido, igual ao _parse_ruff_check).
+        f"dbt deps --project-dir {project_dir_q} --profiles-dir {project_dir_q} 1>&2 && "
+        f"sqlfluff lint --templater dbt --dialect bigquery --format json {config_args} ."
+    )
+    return ["sh", "-c", cmd_str]
+
+
+def _dbt_evaluator_cmd(target: Path, ignore_dirs: list[str] | None = None) -> list[str]:
+    # ignore_dirs não se aplica: os 4 checks rodam sobre o manifest.json
+    # inteiro (todos os models declarados no projeto dbt), não sobre uma
+    # varredura de arquivos soltos do repo.
+    dbt_project_dir = _find_dbt_project_dir(target)
+    if dbt_project_dir is None:
+        return _sqlfluff_error_cmd(
+            f"dbt Project Evaluator: não encontrei dbt_project.yml em {target} nem em um "
+            "subdiretório direto — aponte --target pra raiz do projeto dbt "
+            "(ou pra pasta que contém o projeto dbt)"
+        )
+
+    project_dir_q = shlex.quote(str(dbt_project_dir))
+    evaluator_script_q = shlex.quote(str(LIB_DIR / "review" / "dbt_evaluator.py"))
+    cmd_str = (
+        f"cd {project_dir_q} && "
+        # dbt deps é necessário mesmo só pra gerar o manifest via `dbt parse`:
+        # se packages.yml lista dependências (dbt_utils/dbt_expectations no
+        # fricarne, por ex.) e dbt_packages/ não está instalado, `dbt parse`
+        # falha com "Compilation Error: ... found N package(s) ... but only 0
+        # installed" antes de sequer tentar escrever manifest.json — testado
+        # contra o fricarne removendo dbt_packages/.
+        # Ambos os comandos escrevem log no stdout; sem 1>&2 esse texto
+        # contamina o JSON que dbt_evaluator.py espera ler puro do stdout —
+        # mesmo bug já corrigido no dbt deps da etapa sqlfluff (_sqlfluff_cmd
+        # acima).
+        f"dbt deps --project-dir {project_dir_q} --profiles-dir {project_dir_q} 1>&2 && "
+        f"dbt parse --project-dir {project_dir_q} --profiles-dir {project_dir_q} 1>&2 && "
+        # invocado pelo caminho absoluto do arquivo, não `-m review.dbt_evaluator`:
+        # aqui o cwd é o projeto dbt alvo, não o repo do fh-eng-review, e não
+        # há PYTHONPATH configurado em lugar nenhum (Dockerfile/docker-compose)
+        # — `-m review.dbt_evaluator` falharia com ModuleNotFoundError, testado.
+        f"python3 {evaluator_script_q} {project_dir_q}"
+    )
+    return ["sh", "-c", cmd_str]
+
+
+def _parse_dbt_evaluator(stdout: str, target: Path) -> list[Finding]:
+    try:
+        items = json.loads(stdout or "[]")
+    except json.JSONDecodeError:
+        return []
+    # os caminhos que dbt_evaluator.py devolve são relativos ao dbt_project_dir
+    # (original_file_path do manifest), não a `target` — mesmo recálculo já
+    # feito em _parse_sqlfluff, pro caso do projeto dbt ficar em <target>/fricarne/.
+    dbt_project_dir = _find_dbt_project_dir(target) or target
+    findings = []
+    for it in items:
+        it = dict(it)
+        if it.get("file"):
+            it["file"] = _rel(str(dbt_project_dir / it["file"]), target)
+        findings.append(_finding(**it))
+    return findings
+
+
+def _parse_sqlfluff(stdout: str, target: Path) -> list[Finding]:
+    try:
+        data = json.loads(stdout or "[]")
+    except json.JSONDecodeError:
+        return []
+    # o path que o sqlfluff devolve é relativo ao dbt_project_dir (onde
+    # rodou), não a `target` — recalcula pra bater com o resto do dashboard
+    # (ex.: quando o projeto dbt fica em <target>/fricarne/).
+    dbt_project_dir = _find_dbt_project_dir(target) or target
+    findings = []
+    for file_result in data:
+        abs_file = dbt_project_dir / file_result.get("filepath", "")
+        for v in file_result.get("violations", []):
+            findings.append(
+                _finding(
+                    file=_rel(str(abs_file), target),
+                    line=v.get("start_line_no"),
+                    end_line=v.get("end_line_no"),
+                    rule=v.get("code", ""),
+                    severity="WARNING" if v.get("warning") else "ERROR",
+                    message=v.get("description", ""),
+                )
+            )
+    return findings
+
+
 STEPS = [
     Step("ruff", "Ruff — qualidade de código", _ruff_check_cmd, _parse_ruff_check),
     Step("format", "Ruff — formatação", _ruff_format_cmd, _parse_ruff_format),
@@ -357,4 +576,7 @@ STEPS = [
     ),
     Step("semgrep", "Semgrep — segurança do código", _semgrep_cmd, _parse_semgrep),
     Step("trivy", "Trivy — dependências, segredos e infra", _trivy_cmd, _parse_trivy),
+    Step("yamllint", "Yamllint — lint de YAML", _yamllint_cmd, _parse_yamllint),
+    Step("sqlfluff", "SQLFluff — lint de SQL (dbt)", _sqlfluff_cmd, _parse_sqlfluff),
+    Step("dbt-evaluator", "dbt Project Evaluator (local)", _dbt_evaluator_cmd, _parse_dbt_evaluator),
 ]

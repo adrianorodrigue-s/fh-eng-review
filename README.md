@@ -133,6 +133,7 @@ git add -A && git commit -m "..."
 | 3 | Pytest | testes unitários (pulado se não houver testes) | teste falhando |
 | 4 | Semgrep | SQL Injection, segredos fixos, `eval`, `shell=True` + regras do time | qualquer achado |
 | 5 | Trivy | CVEs em dependências, segredos no repo, misconfig Docker/IaC | HIGH ou CRITICAL |
+| 6 | Yamllint | sintaxe/estrutura de YAML (schema.yml do dbt, docker-compose, GitHub Actions etc.) | qualquer erro ou warning (roda com `--strict`) |
 
 ---
 
@@ -171,6 +172,8 @@ A lib usa a config **do projeto alvo** quando existe, senão cai nos defaults:
 - **Semgrep** → `.semgrep.yml` na raiz do projeto (regras customizadas do
   time — SQL injection, `read_csv` sem encoding etc.); senão
   `config/semgrep-defaults.yml`
+- **Yamllint** → `.yamllint` / `.yamllint.yaml` / `.yamllint.yml` na raiz do
+  projeto; senão `config/yamllint-defaults.yml`
 - **Trivy / etapas / severidade mínima** → `review/steps.py` (também é onde
   se adiciona uma nova etapa, ex.: coverage)
 
@@ -182,9 +185,9 @@ o contrato entre os dois é o JSON em `reports/`.
 ```
 code_review/
 ├── review.sh              ← comando único do engenheiro
-├── Dockerfile             ← imagem python (ruff+semgrep+trivy+pytest)
+├── Dockerfile             ← imagem python (ruff+semgrep+trivy+pytest+yamllint)
 ├── docker-compose.yml     ← serviços: review (python) + dashboard (next.js)
-├── config/                ← defaults de Ruff/Semgrep
+├── config/                ← defaults de Ruff/Semgrep/Yamllint
 ├── review/                ← pacote python (runner, parsers, relatório JSON)
 ├── dashboard/             ← app Next.js + TypeScript (Dockerfile próprio)
 │   ├── app/api/           ← GET /api/projects · GET /api/report?project=&run=
