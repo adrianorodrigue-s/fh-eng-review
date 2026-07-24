@@ -22,6 +22,13 @@ services:
       # keyfile de BigQuery pro sqlfluff (--keyfile no review.sh); sem isso,
       # cai no /dev/null (arquivo vazio, tratado como "sem credencial")
       - ${KEYFILE:-/dev/null}:/secrets/keyfile.json:ro
+      # ADC default do gcloud local (~/.config/gcloud/application_default_
+      # credentials.json do host), fallback automático quando --keyfile não
+      # é passado — só o arquivo é montado, não o diretório gcloud inteiro
+      # (evita expor tokens/sessões do host que o sqlfluff não precisa).
+      # review.sh só exporta ADC_DEFAULT quando o arquivo existe no host;
+      # sem isso, cai no /dev/null igual ao keyfile.
+      - ${ADC_DEFAULT:-/dev/null}:/secrets/adc-default.json:ro
     entrypoint: ["python", "-m", "review", "--target", "/target"]
 
   dashboard:

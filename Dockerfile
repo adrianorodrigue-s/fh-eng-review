@@ -14,7 +14,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir ruff semgrep pytest yamllint
+# pathspec: usado direto por review/steps.py (merge de ignore do yamllint/
+# sqlfluff) — declarado explícito em vez de depender da instalação
+# transitiva que já vem via yamllint.
+RUN pip install --no-cache-dir ruff semgrep pytest yamllint pathspec
 
 # SQLFluff com templater dbt: ele compila o projeto de verdade (resolve
 # ref()/source()/Jinja) antes de lintar, então precisa do dbt-core (via

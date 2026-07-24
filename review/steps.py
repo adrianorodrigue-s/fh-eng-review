@@ -25,9 +25,20 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import pathspec
+import yaml
+
 LIB_DIR = Path(__file__).resolve().parent.parent
 
 Finding = dict
+
+# Pastas que nunca fazem sentido escanear em NENHUM projeto dbt — embutido na
+# lib pra funcionar sem exigir .yamllint/.sqlfluffignore/--ignore-dir
+# configurado no projeto analisado. Fonte única: cli.py usa isso pro default
+# de --ignore-dir (ruff/semgrep/trivy/pytest); _yamllint_effective_config e
+# _sqlfluff_sql_files usam pra montar o ignore de yamllint/sqlfluff.
+UNIVERSAL_IGNORE_DIRS = ["dbt_packages", "target", "logs", ".dbt_venv", "code_review"]
+UNIVERSAL_IGNORE_GLOBS = [f"{d}/" for d in UNIVERSAL_IGNORE_DIRS]
 
 
 def _finding(**kwargs) -> Finding:
@@ -349,20 +360,82 @@ def _parse_trivy(stdout: str, target: Path) -> list[Finding]:
 
 # --- Yamllint -------------------------------------------------------------
 
+_YAMLLINT_PROJECT_NAMES = (".yamllint", ".yamllint.yaml", ".yamllint.yml")
+_YAMLLINT_MERGED = Path(os.environ.get("TMPDIR", "/tmp")) / "review-yamllint-merged.yml"  # noqa: S108
 
-def _yamllint_config_args(target: Path) -> list[str]:
-    """Usa a config do próprio projeto se existir; senão, o default da lib."""
-    for name in (".yamllint", ".yamllint.yaml", ".yamllint.yml"):
-        if (target / name).exists():
-            return []
-    return ["--config-file", str(LIB_DIR / "config" / "yamllint-defaults.yml")]
+
+def _find_project_yamllint(target: Path) -> Path | None:
+    for name in _YAMLLINT_PROJECT_NAMES:
+        candidate = target / name
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _load_yaml_mapping(path: Path) -> dict:
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return data if isinstance(data, dict) else {}
+
+
+def _ignore_lines(value) -> list[str]:
+    if isinstance(value, str):
+        return [ln for ln in value.splitlines() if ln.strip()]
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    return []
+
+
+def _merge_yamllint_rules(base: dict, override: dict) -> dict:
+    merged = dict(base)
+    for rule, val in override.items():
+        if isinstance(val, dict) and isinstance(merged.get(rule), dict):
+            combined = dict(merged[rule])
+            combined.update(val)
+            merged[rule] = combined
+        else:
+            merged[rule] = val
+    return merged
+
+
+def _yamllint_effective_config(target: Path) -> Path:
+    """Gera um config efetivo = ignore universal da lib (UNIVERSAL_IGNORE_DIRS)
+    + regras/ignore do .yamllint do próprio projeto (se existir) por cima —
+    sempre escrito num arquivo temporário e passado via --config-file.
+
+    Não dá pra confiar no `extends:` nativo do yamllint pra fazer esse merge:
+    lendo o pacote instalado (yamllint/config.py:extend()), quando o config
+    filho estende uma base que tem `ignore`, o valor da BASE substitui o do
+    filho inteiro — não concatena. Isso faria o ignore universal da lib
+    desaparecer silenciosamente sempre que o projeto alvo já tivesse o seu
+    próprio `ignore:` (ex.: fricarne). Por isso o merge é feito aqui, em
+    Python, e o resultado final tem `extends: default` apontando só pro
+    ruleset embutido do próprio yamllint (esse sim seguro: não define
+    `ignore`, então não sofre do mesmo problema).
+    """
+    lib_conf = _load_yaml_mapping(LIB_DIR / "config" / "yamllint-defaults.yml")
+    merged_rules = dict(lib_conf.get("rules") or {})
+    merged_ignore = list(UNIVERSAL_IGNORE_GLOBS)
+
+    project_file = _find_project_yamllint(target)
+    if project_file is not None:
+        project_conf = _load_yaml_mapping(project_file)
+        merged_rules = _merge_yamllint_rules(merged_rules, project_conf.get("rules") or {})
+        merged_ignore += _ignore_lines(project_conf.get("ignore"))
+
+    merged = {
+        "extends": "default",
+        "rules": merged_rules,
+        "ignore": "\n".join(dict.fromkeys(merged_ignore)),
+    }
+    _YAMLLINT_MERGED.write_text(yaml.safe_dump(merged, sort_keys=False), encoding="utf-8")
+    return _YAMLLINT_MERGED
 
 
 def _yamllint_cmd(target: Path, ignore_dirs: list[str] | None = None) -> list[str]:
     # yamllint não tem flag de exclusão de diretório (diferente das outras
     # etapas, que usam --exclude/--ignore/--skip-dirs) — quem ignora
-    # diretório é a chave `ignore:` do próprio arquivo de config (ver
-    # config/yamllint-defaults.yml ou o .yamllint do projeto alvo).
+    # diretório é a chave `ignore:` do config, por isso o merge acontece na
+    # geração do config efetivo (_yamllint_effective_config), não aqui.
     # --strict: sem isso, warnings sozinhos não derrubam o exit code (só
     # erros), o que quebraria a regra "qualquer achado reprova" das outras etapas.
     return [
@@ -370,7 +443,8 @@ def _yamllint_cmd(target: Path, ignore_dirs: list[str] | None = None) -> list[st
         "--format",
         "parsable",
         "--strict",
-        *_yamllint_config_args(target),
+        "--config-file",
+        str(_yamllint_effective_config(target)),
         ".",
     ]
 
@@ -409,19 +483,72 @@ def _parse_yamllint(stdout: str, target: Path) -> list[Finding]:
 # --- SQLFluff (dbt) --------------------------------------------------------
 
 # Credencial de BigQuery pro templater dbt: nunca fica na imagem nem no repo.
-# Quem chama `./review.sh ... --keyfile <caminho>` monta o arquivo como
-# volume (docker-compose.yml) e o container recebe essa env var apontando
-# pra ele. google.auth.default() (usado pelo `method: oauth` do dbt-bigquery)
-# já prioriza essa variável antes de sessão gcloud local/metadata server, então
-# o profiles.yml do projeto analisado não precisa mudar nada.
+# google.auth.default() (usado pelo `method: oauth` do dbt-bigquery) resolve
+# a credencial a partir da env var abaixo, então basta apontá-la pro arquivo
+# certo antes de invocar dbt/sqlfluff — o profiles.yml do projeto analisado
+# não precisa mudar nada em nenhum dos dois casos abaixo.
+#
+# Prioridade:
+#   1. --keyfile explícito (review.sh monta em /secrets/keyfile.json)
+#   2. ADC default do gcloud local — ~/.config/gcloud/application_default_
+#      credentials.json do HOST, detectado por review.sh e montado em
+#      /secrets/adc-default.json quando existir (arquivo gerado por
+#      `gcloud auth application-default login`; convenção padrão do gcloud,
+#      não é específica de nenhum projeto — funciona em qualquer máquina que
+#      já tenha rodado esse login alguma vez).
+#   3. nenhum dos dois: falha com mensagem clara (mesmo comportamento de
+#      antes, só que agora cobrindo os dois caminhos).
 _SQLFLUFF_KEYFILE_ENV = "GOOGLE_APPLICATION_CREDENTIALS"
+_ADC_DEFAULT_PATH = Path("/secrets/adc-default.json")
+
+
+def _valid_credential_file(path: Path) -> bool:
+    return path.is_file() and path.stat().st_size > 0
+
+
+def _sqlfluff_credential_path() -> Path | None:
+    explicit = Path(os.environ.get(_SQLFLUFF_KEYFILE_ENV, ""))
+    if _valid_credential_file(explicit):
+        return explicit
+    if _valid_credential_file(_ADC_DEFAULT_PATH):
+        return _ADC_DEFAULT_PATH
+    return None
 
 
 def _sqlfluff_error_cmd(message: str) -> list[str]:
     """Comando "falso" que só imprime uma mensagem clara e falha — usado
-    quando falta pré-requisito (keyfile, dbt_project.yml), pra não deixar
+    quando falta pré-requisito (credencial, dbt_project.yml), pra não deixar
     um stack trace cru do dbt/sqlfluff estourar no dashboard."""
     return ["sh", "-c", f"echo {shlex.quote(message)} >&2; exit 1"]
+
+
+def _sqlfluff_sql_files(dbt_project_dir: Path) -> list[str]:
+    """Lista explícita de .sql (caminhos relativos a dbt_project_dir) pra
+    passar como argumento posicional do sqlfluff, no lugar de ".".
+
+    SQLFluff não tem flag de ignore-path customizado (`sqlfluff lint --help`
+    só tem `-i/--ignore` pra família de erro — parsing/templating — e
+    `--disregard-sqlfluffignores` pra desativar o .sqlfluffignore nativo;
+    nada equivalente a um --ignore-path — confirmado na versão instalada).
+    Por isso a filtragem é feita aqui, em Python: exclui os universais da lib
+    (UNIVERSAL_IGNORE_DIRS) + o que o .sqlfluffignore do próprio projeto
+    listar (se existir) — mesmo princípio de merge do yamllint
+    (_yamllint_effective_config).
+    """
+    patterns = list(UNIVERSAL_IGNORE_GLOBS)
+    project_ignore = dbt_project_dir / ".sqlfluffignore"
+    if project_ignore.exists():
+        patterns += [
+            ln for ln in project_ignore.read_text(encoding="utf-8").splitlines() if ln.strip()
+        ]
+    spec = pathspec.GitIgnoreSpec.from_lines(patterns)
+    files = []
+    for p in dbt_project_dir.rglob("*.sql"):
+        # .as_posix(): pathspec/gitignore casam por "/", independente do SO
+        rel = p.relative_to(dbt_project_dir).as_posix()
+        if not spec.match_file(rel):
+            files.append(rel)
+    return sorted(files)
 
 
 def _find_dbt_project_dir(target: Path) -> Path | None:
@@ -451,13 +578,15 @@ def _sqlfluff_config_args(dbt_project_dir: Path) -> list[str]:
 
 
 def _sqlfluff_cmd(target: Path, ignore_dirs: list[str] | None = None) -> list[str]:
-    # ignore_dirs não se aplica aqui: SQLFluff não tem flag de exclusão de
-    # diretório via CLI (só .sqlfluffignore dentro do projeto dbt) — mesma
-    # limitação já documentada no yamllint.
-    keyfile = Path(os.environ.get(_SQLFLUFF_KEYFILE_ENV, ""))
-    if not keyfile.is_file() or keyfile.stat().st_size == 0:
+    # ignore_dirs (--ignore-dir/UNIVERSAL_IGNORE_DIRS) não chega aqui como
+    # flag de CLI (SQLFluff não tem uma) — é aplicado via _sqlfluff_sql_files,
+    # que já embute UNIVERSAL_IGNORE_DIRS diretamente.
+    credential = _sqlfluff_credential_path()
+    if credential is None:
         return _sqlfluff_error_cmd(
-            "SQLFluff requer keyfile de um projeto dbt válido, use --keyfile <caminho>"
+            "SQLFluff requer credencial do BigQuery: use --keyfile <caminho> ou "
+            "rode `gcloud auth application-default login` na máquina host "
+            "(detectado automaticamente)"
         )
 
     dbt_project_dir = _find_dbt_project_dir(target)
@@ -468,16 +597,25 @@ def _sqlfluff_cmd(target: Path, ignore_dirs: list[str] | None = None) -> list[st
             "(ou pra pasta que contém o projeto dbt)"
         )
 
+    sql_files = _sqlfluff_sql_files(dbt_project_dir)
+    if not sql_files:
+        return _sqlfluff_error_cmd(
+            f"SQLFluff: nenhum .sql em {dbt_project_dir} fora dos diretórios "
+            "ignorados (UNIVERSAL_IGNORE_DIRS + .sqlfluffignore do projeto)"
+        )
+
     project_dir_q = shlex.quote(str(dbt_project_dir))
     config_args = " ".join(shlex.quote(a) for a in _sqlfluff_config_args(dbt_project_dir))
+    files_q = " ".join(shlex.quote(f) for f in sql_files)
     cmd_str = (
         f"cd {project_dir_q} && "
+        f"export {_SQLFLUFF_KEYFILE_ENV}={shlex.quote(str(credential))} && "
         # dbt deps escreve logs no stdout; sem isso esse texto fica
         # concatenado ANTES do JSON que o sqlfluff escreve no stdout,
         # quebrando o json.loads em _parse_sqlfluff (que exige stdout
         # inteiro como JSON válido, igual ao _parse_ruff_check).
         f"dbt deps --project-dir {project_dir_q} --profiles-dir {project_dir_q} 1>&2 && "
-        f"sqlfluff lint --templater dbt --dialect bigquery --format json {config_args} ."
+        f"sqlfluff lint --templater dbt --dialect bigquery --format json {config_args} {files_q}"
     )
     return ["sh", "-c", cmd_str]
 

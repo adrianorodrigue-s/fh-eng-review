@@ -72,6 +72,17 @@ if [[ -n "$KEYFILE_INPUT" ]]; then
     export KEYFILE="$(cd "$(dirname "$KEYFILE_INPUT")" && pwd)/$(basename "$KEYFILE_INPUT")"
 fi
 
+# ADC (Application Default Credentials) do gcloud local: fallback automático
+# do sqlfluff pra quando --keyfile não é passado. Convenção padrão do gcloud
+# (gerado por `gcloud auth application-default login`), não é específica de
+# nenhum projeto — funciona em qualquer máquina que já tenha feito esse
+# login alguma vez. review/steps.py:_sqlfluff_credential_path decide a
+# prioridade entre KEYFILE e este (--keyfile explícito sempre ganha).
+ADC_HOST_PATH="${CLOUDSDK_CONFIG:-$HOME/.config/gcloud}/application_default_credentials.json"
+if [[ -f "$ADC_HOST_PATH" ]]; then
+    export ADC_DEFAULT="$ADC_HOST_PATH"
+fi
+
 docker compose build -q review
 
 set +e
