@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 from .runner import run_review
-from .steps import STEPS
+from .steps import STEPS, UNIVERSAL_IGNORE_DIRS
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -33,7 +33,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--ignore-dir",
         action="append",
-        help="diretórios a serem ignorados pelas ferramentas (default: ['code_review'])",
+        help=(
+            "diretórios extras a ignorar, além dos universais sempre "
+            f"embutidos ({', '.join(UNIVERSAL_IGNORE_DIRS)}) — soma, não substitui"
+        ),
     )
     args = parser.parse_args(argv)
 
@@ -42,7 +45,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Alvo não encontrado: {target}", file=sys.stderr)
         return 2
 
-    ignore_dirs = args.ignore_dir if args.ignore_dir is not None else ["code_review"]
+    ignore_dirs = sorted(set(UNIVERSAL_IGNORE_DIRS) | set(args.ignore_dir or []))
 
     report = run_review(
         target=target,

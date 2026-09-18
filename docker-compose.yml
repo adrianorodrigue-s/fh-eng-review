@@ -6,6 +6,12 @@ services:
   review:
     build: .
     image: etl-code-review:latest
+    environment:
+      # só a etapa sqlfluff usa isso (templater dbt precisa compilar o
+      # projeto). Fica vazio/inexistente quando ninguém passa --keyfile pro
+      # review.sh — nesse caso a etapa falha com mensagem clara, não tenta
+      # usar outra credencial.
+      - GOOGLE_APPLICATION_CREDENTIALS=/secrets/keyfile.json
     volumes:
       # a lib (código + reports) — a imagem não precisa ser reconstruída
       - .:/review
@@ -13,6 +19,16 @@ services:
       - ${TARGET:-..}:/target
       # cache do banco de vulnerabilidades do Trivy (evita re-download a cada run)
       - trivy-cache:/home/reviewer/.cache/trivy
+      # keyfile de BigQuery pro sqlfluff (--keyfile no review.sh); sem isso,
+      # cai no /dev/null (arquivo vazio, tratado como "sem credencial")
+      - ${KEYFILE:-/dev/null}:/secrets/keyfile.json:ro
+      # ADC default do gcloud local (~/.config/gcloud/application_default_
+      # credentials.json do host), fallback automático quando --keyfile não
+      # é passado — só o arquivo é montado, não o diretório gcloud inteiro
+      # (evita expor tokens/sessões do host que o sqlfluff não precisa).
+      # review.sh só exporta ADC_DEFAULT quando o arquivo existe no host;
+      # sem isso, cai no /dev/null igual ao keyfile.
+      - ${ADC_DEFAULT:-/dev/null}:/secrets/adc-default.json:ro
     entrypoint: ["python", "-m", "review", "--target", "/target"]
 
   dashboard:

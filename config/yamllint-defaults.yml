@@ -1,0 +1,8 @@
+# Config Yamllint padrão do time — usada quando a engenharia alvo não tem a
+# sua própria (.yamllint / .yamllint.yaml / .yamllint.yml na raiz do projeto).
+extends: default
+
+rules:
+  line-length:
+    max: 120
+  document-start: disable
